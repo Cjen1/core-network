@@ -4,13 +4,12 @@ let dns = Logs.Src.create "dns" ~doc:"Dns service"
 
 module Log = (val Logs_lwt.src_log dns : Logs_lwt.LOG)
 
-let pp_ip = Ipaddr.V4.pp_hum
+let pp_ip = Ipaddr.V4.pp
 
 let is_dns_query =
   let open Frame in
   function
-  | Ipv4 {payload= Udp {dst= 53; _}; _} | Ipv4 {payload= Tcp {dst= 53; _}; _}
-    ->
+  | Ipv4 {payload= Udp {dst= 53; _}; _} | Ipv4 {payload= Tcp {dst= 53; _}; _} ->
       true
   | _ ->
       false
@@ -18,8 +17,7 @@ let is_dns_query =
 let is_dns_response =
   let open Frame in
   function
-  | Ipv4 {payload= Udp {src= 53; _}; _} | Ipv4 {payload= Tcp {src= 53; _}; _}
-    ->
+  | Ipv4 {payload= Udp {src= 53; _}; _} | Ipv4 {payload= Tcp {src= 53; _}; _} ->
       true
   | _ ->
       false
@@ -27,15 +25,11 @@ let is_dns_response =
 let query_of_pkt =
   let open Frame in
   function
-  | Ipv4 {payload= Udp {dst= 53; payload= Payload buf}}
-  | Ipv4 {payload= Tcp {dst= 53; payload= Payload buf}} ->
-      let open Dns.Packet in
-      Lwt.catch
-        (fun () -> Lwt.return @@ parse buf)
-        (fun e ->
-          Log.err (fun m -> m "dns packet parse err!") >>= fun () -> Lwt.fail e)
+  | Ipv4 {payload= Udp {dst= 53; payload= Payload buf; _}; _}
+  | Ipv4 {payload= Tcp {dst= 53; payload= Payload buf; _}; _} ->
+      Dns.Packet.decode buf
   | _ ->
-      Lwt.fail (Invalid_argument "Not dns query")
+      raise (Invalid_argument "Not dns query")
 
 let try_resolve n () =
   Lwt.catch
@@ -59,8 +53,7 @@ let ip_of_name n =
       >>= function
       | `Later n ->
           Log.debug (fun m -> m "resolve %s later..." n)
-          >>= fun () ->
-          Lwt_unix.sleep 1. >>= fun () -> keep_trying n (succ cnt)
+          >>= fun () -> Lwt_unix.sleep 1. >>= fun () -> keep_trying n (succ cnt)
       | `Resolved (n, ip) ->
           Log.info (fun m -> m "resolved: %s %a" n pp_ip ip)
           >>= fun () -> Lwt.return ip
@@ -78,13 +71,15 @@ let to_dns_response pkt resp =
         Ipv4_packet.
           { options= Cstruct.create 0
           ; src
+          ; id= Random.int 65535
+          ; off= 0
           ; dst
           ; ttl= 38
           ; proto= Marshal.protocol_to_int `UDP }
       in
       let ip_hd_wire = Cstruct.create Ipv4_wire.sizeof_ipv4 in
       match Ipv4_packet.Marshal.into_cstruct ~payload_len ip_hd ip_hd_wire with
-      | Error e ->
+      | Error _e ->
           raise @@ Failure "to_response_pkt -> into_cstruct"
       | Ok () ->
           Ipv4_wire.set_ipv4_id ip_hd_wire (Random.int 65535) ;
@@ -113,30 +108,19 @@ let to_dns_response pkt resp =
   | _ ->
       assert false
 
-let process_dns_query ~resolve pkt =
-  let open Dns in
-  query_of_pkt pkt
-  >>= fun query ->
-  (let names = Packet.(List.map (fun {q_name; _} -> q_name) query.questions) in
-   let name = List.hd names |> Name.to_string in
-   resolve name
-   >>= function
+(*function
    | Ok (src_ip, resolved) ->
        Log.debug (fun m ->
-           m "Dns_service: allowed %a to resolve %s" pp_ip src_ip name)
+           m "Dns_service: allowed %a to resolve %a" pp_ip src_ip Domain_name.pp
+             name)
        >>= fun () ->
-       let name = Dns.Name.of_string name in
        let rrs =
          Dns.Packet.
            [{name; cls= RR_IN; flush= false; ttl= 0l; rdata= A resolved}]
        in
        Lwt.return
          Dns.Query.
-           { rcode= NoError
-           ; aa= true
-           ; answer= rrs
-           ; authority= []
-           ; additional= [] }
+           {rcode= NoError; aa= true; answer= rrs; authority= []; additional= []}
    | Error src_ip ->
        Log.info (fun m ->
            m "Dns_service: banned %a to resolve %s" pp_ip src_ip name)
@@ -148,6 +132,36 @@ let process_dns_query ~resolve pkt =
            ; answer= []
            ; authority= []
            ; additional= [] })
-  >>= fun answer ->
-  let resp = Query.response_of_answer query answer in
-  Lwt.return @@ Packet.marshal resp
+         *)
+let process_dns_query ~resolve pkt =
+  let open Dns in
+  let dns_pkt =
+    match query_of_pkt pkt with Ok q -> q | Error _e -> raise Exit
+  in
+  let name, _typ = dns_pkt.question in
+  resolve (Domain_name.to_string name)
+  >>= (function
+        | Ok (src_ip, resolved) ->
+            (* source ip of the packet and resolved address *)
+            Log.debug (fun m ->
+                m "Dns_service: allowed %a to resolve %a" pp_ip src_ip
+                  Domain_name.pp name)
+            >>= fun () ->
+            let answer =
+              Domain_name.Map.singleton name
+                Rr_map.(singleton A Ipv4_set.(Int32.zero, singleton resolved))
+            in
+            let data = `Answer (answer, Name_rr_map.empty) in
+            Lwt.return data
+        | Error _src_ip ->
+            let data =
+              `Rcode_error
+                (Dns.Rcode.(NXDomain), Packet.opcode_data dns_pkt.data, None)
+            in
+            Lwt.return data)
+  >>= fun data ->
+  let header = dns_pkt.header in
+  let question = dns_pkt.question in
+  let authoritative = Packet.Flags.singleton `Authoritative in
+  let pkt = Packet.create (fst header, authoritative) question data in
+  Lwt.return @@ fst @@ Packet.encode `Tcp pkt

@@ -102,7 +102,7 @@ let parse_arp_pkt inner =
   >>= fun () ->
   let get_ha buf offset =
     let raw = Cstruct.sub buf offset 6 in
-    Macaddr.of_bytes_exn @@ Cstruct.to_string raw
+    Macaddr.of_octets_exn @@ Cstruct.to_string raw
   in
   let code = Cstruct.BE.get_uint16 inner 6 in
   let sha = get_ha inner (6 + 2) in
@@ -120,17 +120,17 @@ let parse buf =
     >>= fun () ->
     let ethertype = Cstruct.BE.get_uint16 buf 12 in
     let dst_option =
-      Cstruct.sub buf 0 6 |> Cstruct.to_string |> Macaddr.of_bytes
+      Cstruct.sub buf 0 6 |> Cstruct.to_string |> Macaddr.of_octets
     in
     let src_option =
-      Cstruct.sub buf 6 6 |> Cstruct.to_string |> Macaddr.of_bytes
+      Cstruct.sub buf 6 6 |> Cstruct.to_string |> Macaddr.of_octets
     in
     match (dst_option, src_option) with
-    | None, _ ->
+    | Error _, _ ->
         Error (`Msg "failed to parse ethernet destination MAC")
-    | _, None ->
+    | _, Error _ ->
         Error (`Msg "failed to parse ethernet source MAC")
-    | Some dst, Some src ->
+    | Ok dst, Ok src ->
         let inner = Cstruct.shift buf 14 in
         if ethertype = 0x0800 then
           parse_ipv4_pkt inner
@@ -146,7 +146,7 @@ let rec fr_info = function
   | Ethernet {src; dst; _} ->
       Printf.sprintf "Ethernet %s ->%s" (Macaddr.to_string src)
         (Macaddr.to_string dst)
-  | Arp {op} ->
+  | Arp {op;_} ->
       Printf.sprintf "Arp %s"
         ( match op with
         | `Request ->
@@ -155,7 +155,7 @@ let rec fr_info = function
             "reply"
         | `Unknown ->
             "unknown" )
-  | Ipv4 {src; dst; payload} ->
+  | Ipv4 {src; dst; payload;_} ->
       let payload_str = fr_info payload in
       Printf.sprintf "Ipv4 %s -> %s {%s}" (Ipaddr.V4.to_string src)
         (Ipaddr.V4.to_string dst) payload_str
